@@ -7,6 +7,8 @@ import timeit
 import numpy as np
 import os
 import argparse
+from tvm import autotvm
+import topi
 
 num_threads = 28
 os.environ["TVM_NUM_THREADS"] = str(num_threads)
@@ -299,7 +301,7 @@ def packed_conv(bs, oc, ic, nh, nw, kh, kw, ph=0, pw=0, sh=1, sw=1):
 
     return mod
 
-def test_packed_conv(bs, oc, ic, nh, nw, kh, kw, ph=0, pw=0, sh=1, sw=1):
+def dnnl_similar_conv(bs, oc, ic, nh, nw, kh, kw, ph=0, pw=0, sh=1, sw=1):
     """2-D conv
 
     oc, ic : output and input channels.
@@ -317,6 +319,8 @@ def test_packed_conv(bs, oc, ic, nh, nw, kh, kw, ph=0, pw=0, sh=1, sw=1):
     ph, pw : height and width padding
     toc, tic : the tiling sizes of the output and input channels
     """
+
+    ## Similar schedule as dnnl
     toc = 16
     tic = 16
     tw = 4
@@ -362,55 +366,31 @@ def test_packed_conv(bs, oc, ic, nh, nw, kh, kw, ph=0, pw=0, sh=1, sw=1):
     s = te.create_schedule(Y.op)
 
     CachedY = s.cache_write(PackedY, 'local')
-    bso, oc_out, h, w, oc_in = s[PackedY].op.axis
 
     # self test by leslie
-    s[PackedY].reorder(bso, h, w, oc_out, oc_in)
+    bso, oc_out, h, w, oc_in = s[PackedY].op.axis
 
-    #bso, h, w, oc_out, oc_in = s[PackedY].op.axis
+    s[PackedY].reorder(bso, h, w, oc_out, oc_in)
 
     w_out, w_in = s[PackedY].split(w, factor=tw)  # Split the columns
 
     bso_h_w_out = s[PackedY].fuse(bso, h, w_out)
     s[PackedY].parallel(bso_h_w_out)
 
+    #CachedY = s.cache_write(PackedY, 'local')
+
     s[CachedY].compute_at(s[PackedY], bso_h_w_out)
 
-    _, _, cw, c_oc_out, c_oc_in = CachedY.op.axis
+    c_bso, c_oc_out, ch, cw, c_oc_in = CachedY.op.axis
 
     ric_out, rkh, rkw, ric_in = CachedY.op.reduce_axis
 
-    s[CachedY].reorder(ric_out, rkh, rkw, ric_in, cw, c_oc_out, c_oc_in)
+    s[CachedY].reorder(ric_out, rkh, rkw, ric_in, c_oc_out, cw, c_oc_in)
 
     s[CachedY].unroll(cw)
-    s[CachedY].unroll(c_oc_out)
+    #s[CachedY].unroll(c_oc_out)
     s[CachedY].vectorize(c_oc_in)
 
-    # _, _, cw, c_oc_out, c_oc_in = PackedY.op.axis
-    # ric_out, rkh, rkw, ric_in = PackedY.op.reduce_axis
-
-    # s[PackedY].reorder(ric_out, rkh, rkw, ric_in, cw, c_oc_out, c_oc_in)
-    # s[PackedY].unroll(cw)
-    # s[PackedY].unroll(c_oc_out)
-    # s[PackedY].vectorize(c_oc_in)
-
-
-
-    # oc_out_h = s[PackedY].fuse(bso, oc_out, h)
-    # # Parallel on the first two dimensions oc_out and h
-    # s[PackedY].parallel(oc_out_h)
-    # # Optimize the computation of a cached output block
-    # w_out, w_in = s[PackedY].split(w, factor=tw)  # Split the columns
-    #
-    # s[CachedY].compute_at(s[PackedY], w_out)
-    #
-    # _, _, _, cw, oc_in = CachedY.op.axis
-    # ric_out, rkh, rkw, ric_in = CachedY.op.reduce_axis
-    #
-    # s[CachedY].reorder(ric_out, rkh, rkw, ric_in, cw, oc_in)
-    # s[CachedY].unroll(ric_in)
-    # s[CachedY].unroll(cw)
-    # s[CachedY].vectorize(oc_in)
     # Schedule the padding by adding thread-level parallelism
     if PaddedX != X:
         s[PaddedX].parallel(PaddedX.op.axis[0])
@@ -426,6 +406,133 @@ def test_packed_conv(bs, oc, ic, nh, nw, kh, kw, ph=0, pw=0, sh=1, sw=1):
     print(tvm.lower(s, [X, K, Y], simple_mode=True))
 
     mod = tvm.build(s, [X, K, Y], target=target)
+
+    return mod
+
+def autoTVM_conv(bs, oc, ic, nh, nw, kh, kw, ph=0, pw=0, sh=1, sw=1):
+    """
+        use autoTVM to get the best throughput
+    """
+    @autotvm.template("leslie/second_conv")
+    def my_tune(bs, oc, ic, nh, nw, kh, kw, ph, pw, sh, sw):
+        # toc = 16
+        # tic = 16
+        # tw = 4
+
+        cfg = autotvm.get_config()
+        cfg.define_knob("tile_w", [1, 2, 4])
+        cfg.define_knob("tile_oc", [16, 32, 64])
+        cfg.define_knob("tile_ic", [16, 32, 64])
+
+        tic = cfg["tile_ic"].val
+        toc = cfg["tile_oc"].val
+        tw = cfg["tile_w"].val
+
+        X = te.placeholder((bs, ic, nh, nw), name='X')
+        K = te.placeholder((oc, ic, kh, kw), name='K')
+        PaddedX = padding(X, ph, pw) if ph * pw != 0 else X
+        # pack X and K
+        assert ic % tic == 0 and oc % toc == 0
+
+        PackedX = te.compute(
+            (bs, ic // tic, nh + ph * 2, nw + pw * 2, tic),
+            lambda b, ic_out, x, y, ic_in: PaddedX[b, ic_out * tic + ic_in, x, y],
+            name='PackedX')
+
+        PackedK = te.compute(
+            (oc // toc, ic // tic, kh, kw, tic, toc),
+            lambda oc_out, ic_out, x, y, ic_in, oc_in: K[
+                oc_out * toc + oc_in, ic_out * tic + ic_in, x, y],
+            name='PackedK')
+
+        # reduction axes
+        ric_in = te.reduce_axis((0, tic), name='ric_in')
+        ric_out = te.reduce_axis((0, ic // tic), name='ric_out')
+        rkh = te.reduce_axis((0, kh), name='rkh')
+        rkw = te.reduce_axis((0, kw), name='rkw')
+        # output height and weights
+        oh = conv_out_size(nh, kh, ph, sh)
+        ow = conv_out_size(nw, kw, pw, sw)
+
+        # Compuated Y in the packed layout
+        PackedY = te.compute(
+            (bs, oc // toc, oh, ow, toc),
+            lambda b, oc_out, x, y, oc_in: te.sum(
+                PackedX[b, ric_out, x * sh + rkh, y * sw + rkw, ric_in] *
+                PackedK[oc_out, ric_out, rkh, rkw, ric_in, oc_in],
+                axis=[ric_out, rkh, rkw, ric_in]), name='Y')
+
+        # Unpack the result
+        Y = te.compute((bs, oc, oh, ow),
+                       lambda b, oc, x, y: PackedY[b, oc // toc, x, y, oc % toc],
+                       name='Y')
+
+        s = te.create_schedule(Y.op)
+
+        CachedY = s.cache_write(PackedY, 'local')
+
+        # self test by leslie
+        bso, oc_out, h, w, oc_in = s[PackedY].op.axis
+
+        s[PackedY].reorder(bso, h, w, oc_out, oc_in)
+
+        #w_out, w_in = s[PackedY].split(w, cfg["tile_w"].val)  # Split the columns
+        w_out, w_in = s[PackedY].split(w, tw)
+
+        bso_h_w_out = s[PackedY].fuse(bso, h, w_out)
+        s[PackedY].parallel(bso_h_w_out)
+
+        # CachedY = s.cache_write(PackedY, 'local')
+
+        s[CachedY].compute_at(s[PackedY], bso_h_w_out)
+
+        c_bso, c_oc_out, ch, cw, c_oc_in = CachedY.op.axis
+
+        ric_out, rkh, rkw, ric_in = CachedY.op.reduce_axis
+
+        s[CachedY].reorder(ric_out, rkh, rkw, ric_in, c_oc_out, cw, c_oc_in)
+
+        s[CachedY].unroll(cw)
+        # s[CachedY].unroll(c_oc_out)
+        s[CachedY].vectorize(c_oc_in)
+
+        # Schedule the padding by adding thread-level parallelism
+        if PaddedX != X:
+            s[PaddedX].parallel(PaddedX.op.axis[0])
+        # Optimize the packing of X and K
+        s[PackedX].parallel(s[PackedX].fuse(*PackedX.op.axis[0:2]))
+        s[PackedX].unroll(PackedX.op.axis[-1])
+        s[PackedK].parallel(s[PackedK].fuse(*PackedK.op.axis[0:2]))
+        s[PackedK].unroll(PackedK.op.axis[-1])
+        # Optimize the unpacking of Y
+        s[Y].parallel(s[Y].fuse(*Y.op.axis[0:2]))
+        s[Y].unroll(Y.op.axis[-1])
+
+        return s, [X, K, Y]
+
+    #param = (bs, oc, ic, nh, nw, kh, kw, ph, pw, sh, sw)
+    task = autotvm.task.create("leslie/second_conv", args=(bs, oc, ic, nh, nw, kh, kw, ph, pw, sh, sw), target=target)
+    #task = autotvm.task.create(bs, oc, ic, nh, nw, kh, kw, ph, pw, sh, sw)
+    print(task.config_space)
+    print(len(task.config_space))
+    measure_option = autotvm.measure_option(builder=autotvm.LocalBuilder(timeout=10000),
+                                            runner=autotvm.LocalRunner(repeat=1, number=10, min_repeat_ms=1000, timeout=1000))
+
+    logfile = 'leslie_tune.log'
+    os.system("rm -rf {}".format(logfile))
+    tuner = autotvm.tuner.XGBTuner(task)
+    #n_trial = len(task.config_space)
+    n_trial = len(task.config_space)
+    prefix = "[Task]"
+    tuner.tune(n_trial=n_trial, measure_option=measure_option, callbacks=[autotvm.callback.progress_bar(n_trial, prefix=prefix),
+                                                                          autotvm.callback.log_to_file(logfile)])
+
+    # evalute task
+    with autotvm.apply_history_best(logfile):
+        print("Compiling")
+        with tvm.target.create(target):
+            s, arg_bufs = my_tune(bs, oc, ic, nh, nw, kh, kw, ph, pw, sh, sw)
+            mod = tvm.build(s, arg_bufs, target=target)
 
     return mod
 
@@ -446,7 +553,9 @@ if __name__ == "__main__":
         #mod = default_conv(bs, oc, ic, n, n, k, k, p, p, s, s)
         #mod = cached_block_conv(bs, oc, ic, n, n, k, k, p, p, s, s)
         #mod = packed_conv(bs, oc, ic, n, n, k, k, p, p, s, s)
-        mod = test_packed_conv(bs, oc, ic, n, n, k, k, p, p, s, s)
+        mod = dnnl_similar_conv(bs, oc, ic, n, n, k, k, p, p, s, s)
+
+        #mod = autoTVM_conv(bs, oc, ic, n, n, k, k, p, p, s, s)
 
         os.system("rm -rf ./export && mkdir export")
         mod.export_library(path_lib)
@@ -470,24 +579,17 @@ if __name__ == "__main__":
         print("gflops: {}".format(gflops))
 
         outnp = out.asnumpy()
-        print(type(outnp))
-        print(outnp.shape)
-
 
         import tensorflow as tf
-        print(type(data))
-        print(data.asnumpy().shape)
-        print(weight.asnumpy().shape)
         data = np.transpose(data.asnumpy(), (0, 2, 3, 1))
         weight = np.transpose(weight.asnumpy(), (2, 3, 1, 0))
         t_out = tf.nn.conv2d(data, weight, strides=[1, 1, 1, 1], padding='SAME')
         t_out = t_out.numpy()
         t_out = np.transpose(t_out, (0, 3, 1, 2))
-        print(type(t_out))
-
-        print("-----------------")
-        print(t_out.shape)
-        print(outnp.shape)
+        # print(type(t_out))
+        # print("-----------------")
+        # print(t_out.shape)
+        # print(outnp.shape)
         np.testing.assert_allclose(t_out, outnp, atol=1e-3)
 
 
